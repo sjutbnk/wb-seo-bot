@@ -1,161 +1,265 @@
 """
 Сервис генерации SEO-контента для карточки товара WB через Gemini API.
-Использует Gemini 2.5 Flash (бесплатный tier).
+
+Логика выбора модели (по загруженности серверов):
+  gemini-3.1-flash → gemini-3.1-flash-lite → gemini-3.5-flash
+
+Переключение происходит автоматически при ошибках 429/503/overloaded.
 """
 
 import logging
-from typing import TYPE_CHECKING
 
 import google.generativeai as genai
 
 from config import settings
 from services.wb_api import CompetitorProduct
 
-if TYPE_CHECKING:
-    pass
-
 logger = logging.getLogger(__name__)
+
+# Порядок fallback по загруженности серверов
+_FALLBACK_MODELS: list[str] = [
+    "gemini-3.1-flash",
+    "gemini-3.1-flash-lite",
+    "gemini-3.5-flash",
+]
 
 # Инициализация клиента Gemini
 genai.configure(api_key=settings.GEMINI_API_KEY)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ПРОМПТ
+# ─────────────────────────────────────────────────────────────────────────────
 
-SEO_SYSTEM_PROMPT = """Ты — эксперт по SEO-оптимизации карточек товаров на маркетплейсе Wildberries.
-Твоя задача — создавать SEO-контент, который одновременно:
-1. Соответствует поисковым запросам покупателей на WB
-2. Удовлетворяет алгоритмам ранжирования Wildberries
-3. Читается естественно и убедительно для покупателя
+_SYSTEM_PROMPT = """Ты — топовый WB-маркетолог и SEO-специалист с 7-летним опытом вывода \
+товаров в ТОП на Wildberries. Ты знаешь всё об алгоритмах WB, психологии покупателя и \
+продающих текстах.
 
-Алгоритм Wildberries учитывает:
-- Точное вхождение ключевых слов в название (наибольший вес)
-- Вхождение ключей в описание
-- Релевантность категории
-- Уникальность контента
+═══════════════════════════════════════
+КАК РАБОТАЕТ АЛГОРИТМ WILDBERRIES
+═══════════════════════════════════════
+Алгоритм ранжирует карточки по совокупности сигналов:
 
-Правила:
-- Название: до 60 символов, главный ключ в начале
-- Описание: 500-2000 символов, ключи вписаны органично
-- Не используй символ | в названии
-- Избегай переспама ключей (не более 3-4 вхождений одного слова)
-- Не используй CAPS LOCK
+1. НАЗВАНИЕ (наибольший вес в ранжировании):
+   — Точное вхождение высокочастотного ключа ОБЯЗАТЕЛЬНО в первых 3-5 словах
+   — Максимум 60 символов (WB обрезает остальное в выдаче)
+   — Никаких символов | / \\ и CAPS LOCK
+   — Не использовать слова "лучший", "топ", "хит" — WB их фильтрует
+   — Структура: [ГЛАВНЫЙ КЛЮЧ] + [уточнение/характеристика] + [бренд если есть]
+
+2. ОПИСАНИЕ (второй по важности сигнал):
+   — Минимум 800 символов, идеал 1500-2000
+   — Ключи должны входить ЕСТЕСТВЕННО, не спамом
+   — Плотность ключей: каждый ВЧ-ключ — 2-3 вхождения, СЧ/НЧ — 1-2
+   — Структура: крючок (боль/желание) → УТП → характеристики → сценарии → призыв
+   — Абзацы по 3-5 предложений, текст "дышит"
+
+3. КЛЮЧЕВЫЕ СЛОВА:
+   — WB индексирует всё, что есть в названии + описании
+   — Разделяй на уровни: ВЧ (>10к запросов), СЧ (1к-10к), НЧ (<1к)
+   — НЧ-ключи = низкая конкуренция + горячий спрос → их часто игнорируют конкуренты
+
+═══════════════════════════════════════
+ПРИНЦИПЫ ПРОДАЮЩЕГО ОПИСАНИЯ
+═══════════════════════════════════════
+— Первое предложение = крючок: зацепи болью или желанием покупателя
+— Не перечисляй характеристики скучным списком — переводи их в ВЫГОДЫ
+  ПЛОХО: "Подошва из резины"
+  ХОРОШО: "Прорезиненная подошва не скользит даже на мокром асфальте — ты уверен в каждом шаге"
+— Используй сенсорные слова: мягкий, лёгкий, дышащий, прочный, надёжный
+— Закрывай возражения прямо в тексте: "не нужна стирка", "не мнётся в чемодане"
+— Заканчивай призывом к действию: "Добавь в корзину и получи уже через 2 дня"
 """
 
+
+def _build_user_prompt(
+    user_query: str,
+    suggestions: list[str],
+    competitors: list[CompetitorProduct],
+    keyword_stats: dict[str, int] | None = None,
+) -> str:
+    """Формирует итоговый промпт с данными конкурентов, ключами и частотностью."""
+
+    # ── Блок ключевых слов ────────────────────────────────────────────────────
+    if suggestions:
+        kw_lines_list = []
+        for kw in suggestions:
+            freq = keyword_stats.get(kw) if keyword_stats else None
+            freq_str = f"  (~{freq:,} показов/мес)".replace(",", " ") if freq else ""
+            kw_lines_list.append(f"  • {kw}{freq_str}")
+        kw_lines = "\n".join(kw_lines_list)
+    else:
+        kw_lines = "  (не найдены)"
+
+
+    # ── Блок конкурентов ──────────────────────────────────────────────────────
+    if competitors:
+        comp_lines: list[str] = []
+        for i, c in enumerate(competitors[:8], start=1):
+            desc = c.description.strip()
+            desc_preview = (desc[:400] + "…") if len(desc) > 400 else (desc or "нет описания")
+            comp_lines.append(
+                f"  [{i}] Название: «{c.name}»\n"
+                f"       Бренд: {c.brand} | Категория: {c.subject_name}\n"
+                f"       Описание: {desc_preview}"
+            )
+        competitors_block = "\n\n".join(comp_lines)
+    else:
+        competitors_block = "  (конкуренты не найдены — создай карточку только на основе ключей)"
+
+    return f"""
+═══════════════════════════════════════
+ВХОДНЫЕ ДАННЫЕ
+═══════════════════════════════════════
+
+Товар (запрос продавца): «{user_query}»
+
+── Ключевые слова из поиска WB (реальные автоподсказки покупателей) ──
+{kw_lines}
+
+── Топ конкурентов в выдаче WB ──
+{competitors_block}
+
+═══════════════════════════════════════
+ЗАДАНИЕ
+═══════════════════════════════════════
+
+Проанализируй конкурентов и ключевые слова. Найди:
+1. Какие ВЧ-ключи конкуренты используют в названиях
+2. Какие выгоды и боли покупателей упоминают в описаниях
+3. Что конкуренты УПУСКАЮТ — это твоя возможность выделиться
+
+Затем создай карточку по формату ниже. Отвечай СТРОГО по формату, без вводных слов.
+
+───────────────────────────────────────
+### НАЗВАНИЕ
+───────────────────────────────────────
+[Одна строка. Максимум 60 символов. Главный ВЧ-ключ в начале. Без точки в конце.]
+
+───────────────────────────────────────
+### ОПИСАНИЕ
+───────────────────────────────────────
+[Продающий текст 1200-2000 символов.
+Структура:
+• Абзац 1 (крючок): Зацепи болью или желанием — 2-3 предложения
+• Абзац 2 (УТП): Чем этот товар лучше аналогов — конкретно, с выгодами
+• Абзац 3 (характеристики через выгоды): Не "состав 100% хлопок", а "натуральный хлопок — кожа дышит весь день"
+• Абзац 4 (сценарии): Когда и как используют — создай образ в голове покупателя
+• Абзац 5 (закрытие + призыв): Закрой главное возражение, добавь призыв к покупке
+Ключевые слова вписаны органично. Никаких SEO-спама и сухих перечислений.]
+
+───────────────────────────────────────
+### КЛЮЧЕВЫЕ СЛОВА
+───────────────────────────────────────
+[Список 20-30 фраз через запятую.
+Формат: сначала ВЧ (высокочастотные) → затем СЧ → затем НЧ.
+Включи: синонимы, словоформы, уточняющие запросы, смежные категории.
+НЧ-запросы особенно важны — они дают быстрый трафик с низкой конкуренцией.]
+
+───────────────────────────────────────
+### АНАЛИЗ КОНКУРЕНТОВ
+───────────────────────────────────────
+[5-7 конкретных инсайтов:
+• Что делают все конкуренты (и что повторить)
+• Что конкуренты упускают (и как на этом сыграть)
+• Какие ключи они игнорируют
+• Какие выгоды не закрывают в описаниях
+• Слабые места их карточек]
+"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ОСНОВНАЯ ФУНКЦИЯ
+# ─────────────────────────────────────────────────────────────────────────────
 
 async def generate_seo_card(
     user_query: str,
     suggestions: list[str],
     competitors: list[CompetitorProduct],
+    keyword_stats: dict[str, int] | None = None,
 ) -> dict[str, str]:
     """
     Генерирует SEO-оптимизированную карточку товара.
 
     Args:
-        user_query: исходный запрос пользователя (название/тип товара)
+        user_query: исходный запрос пользователя
         suggestions: список ключевых слов из автоподсказок WB
         competitors: список товаров-конкурентов с их данными
+        keyword_stats: опционально — частотность ключей из WB Partner API
+
+    Автоматически перебирает модели при ошибках загруженности:
+      gemini-3.1-flash → gemini-3.1-flash-lite → gemini-3.5-flash
 
     Returns:
-        Словарь с полями: title, description, keywords
+        Словарь с полями: title, description, keywords, analysis, raw
     """
-    # Формируем контекст из данных конкурентов
-    competitors_context = _build_competitors_context(competitors)
-    keywords_context = _build_keywords_context(suggestions)
+    user_prompt = _build_user_prompt(user_query, suggestions, competitors, keyword_stats)
 
-    prompt = f"""{SEO_SYSTEM_PROMPT}
+    # Строим список моделей: настройка из .env → fallback-цепочка
+    model_chain = _build_model_chain()
 
----
+    last_error: Exception | None = None
 
-## Задача
-
-Создай SEO-карточку для товара по запросу: **"{user_query}"**
-
-## Ключевые слова из поиска WB (автоподсказки покупателей)
-
-{keywords_context}
-
-## Анализ топ конкурентов в выдаче WB
-
-{competitors_context}
-
----
-
-## Что нужно создать
-
-Верни ответ СТРОГО в следующем формате (без лишнего текста):
-
-### НАЗВАНИЕ
-[Название товара, до 60 символов, главный ключ в начале]
-
-### ОПИСАНИЕ
-[Продающее описание 500-2000 символов. Ключевые слова вписаны органично. Структурировано: УТП → характеристики → сценарии использования → призыв к действию]
-
-### КЛЮЧЕВЫЕ СЛОВА
-[Список из 15-25 ключевых слов через запятую, от высокочастотных к низкочастотным]
-
-### АНАЛИЗ
-[3-5 коротких инсайта о стратегии SEO конкурентов, что использовать и что избежать]
-"""
-
-    models_to_try = [
-        settings.GEMINI_MODEL,
-        "gemini-2.5-flash",
-        "gemini-3.1-flash",
-        "gemini-3.5-flash-lite",
-    ]
-    # Удаляем дубликаты сохраняя порядок
-    seen = set()
-    models_to_try = [m for m in models_to_try if not (m in seen or seen.add(m))]
-
-    last_error = None
-    for model_name in models_to_try:
+    for model_name in model_chain:
         try:
-            model = genai.GenerativeModel(model_name)
+            logger.info("Пробую модель: %s", model_name)
+            model = genai.GenerativeModel(
+                model_name=model_name,
+                system_instruction=_SYSTEM_PROMPT,
+            )
             response = await model.generate_content_async(
-                prompt,
+                user_prompt,
                 generation_config=genai.GenerationConfig(
-                    temperature=0.7,
-                    max_output_tokens=2048,
+                    temperature=0.8,
+                    max_output_tokens=3000,
                 ),
             )
-            raw_text = response.text
-            return _parse_seo_response(raw_text)
+            logger.info("Успешно использована модель: %s", model_name)
+            return _parse_seo_response(response.text)
+
         except Exception as e:
-            logger.warning("Не удалось использовать модель %s: %s", model_name, e)
-            last_error = e
+            err_str = str(e).lower()
+            # Переключаемся на следующую модель при перегруженности или недоступности
+            if any(code in err_str for code in ("429", "503", "overload", "unavailable", "404", "not found")):
+                logger.warning("Модель %s недоступна (%s), переключаюсь...", model_name, e)
+                last_error = e
+                continue
+            # Остальные ошибки (авторизация, квота и т.д.) — сразу падаем
+            logger.error("Критическая ошибка Gemini [%s]: %s", model_name, e)
+            raise RuntimeError(f"Ошибка Gemini API: {e}") from e
 
-    logger.error("Все попытки генерации Gemini завершились ошибкой")
-    raise RuntimeError(f"Ошибка Gemini API: {last_error}") from last_error
-
-
-def _build_competitors_context(competitors: list[CompetitorProduct]) -> str:
-    """Форматирует данные конкурентов для промпта."""
-    if not competitors:
-        return "Конкуренты не найдены."
-
-    lines: list[str] = []
-    for i, c in enumerate(competitors[:8], start=1):
-        desc_preview = c.description[:300] + "..." if len(c.description) > 300 else c.description
-        lines.append(
-            f"{i}. **{c.name}** (бренд: {c.brand}, категория: {c.subject_name})\n"
-            f"   Описание: {desc_preview or 'нет описания'}"
-        )
-    return "\n\n".join(lines)
+    logger.error("Все модели в цепочке недоступны")
+    raise RuntimeError(
+        f"Все модели Gemini временно недоступны. Последняя ошибка: {last_error}"
+    ) from last_error
 
 
-def _build_keywords_context(suggestions: list[str]) -> str:
-    """Форматирует ключевые слова для промпта."""
-    if not suggestions:
-        return "Ключевые слова не найдены."
-    return "\n".join(f"- {kw}" for kw in suggestions)
+def _build_model_chain() -> list[str]:
+    """
+    Строит цепочку моделей для перебора.
+    Если в .env указана конкретная модель — она идёт первой,
+    затем стандартный fallback-порядок.
+    """
+    chain = list(_FALLBACK_MODELS)  # копия
 
+    # Если пользователь задал кастомную модель и её нет в цепочке — ставим первой
+    custom = settings.GEMINI_MODEL.strip()
+    if custom and custom not in chain:
+        chain.insert(0, custom)
+
+    return chain
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ХЕЛПЕРЫ ПАРСИНГА
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _parse_seo_response(raw_text: str) -> dict[str, str]:
     """
     Парсит структурированный ответ Gemini в словарь.
     Если структура нарушена — возвращает весь текст в поле 'raw'.
     """
-    sections = {
+    sections: dict[str, str] = {
         "title": "",
         "description": "",
         "keywords": "",
@@ -163,37 +267,44 @@ def _parse_seo_response(raw_text: str) -> dict[str, str]:
         "raw": "",
     }
 
-    # Маркеры секций
     markers = {
         "### НАЗВАНИЕ": "title",
         "### ОПИСАНИЕ": "description",
         "### КЛЮЧЕВЫЕ СЛОВА": "keywords",
+        "### АНАЛИЗ КОНКУРЕНТОВ": "analysis",
+        # Fallback если модель написала без "КОНКУРЕНТОВ"
         "### АНАЛИЗ": "analysis",
     }
 
-    current_section: str | None = None
+    current_key: str | None = None
     buffer: list[str] = []
 
     for line in raw_text.split("\n"):
-        matched = False
+        stripped = line.strip()
+
+        matched_key: str | None = None
         for marker, key in markers.items():
-            if line.strip().startswith(marker):
-                # Сохраняем предыдущую секцию
-                if current_section:
-                    sections[current_section] = "\n".join(buffer).strip()
-                current_section = key
-                buffer = []
-                matched = True
+            if stripped.startswith(marker):
+                matched_key = key
                 break
-        if not matched and current_section:
-            buffer.append(line)
+
+        if matched_key:
+            # Сохраняем накопленный буфер предыдущей секции
+            if current_key is not None:
+                sections[current_key] = "\n".join(buffer).strip()
+            current_key = matched_key
+            buffer = []
+        elif current_key is not None:
+            # Пропускаем строки-разделители (───)
+            if not stripped.startswith("───"):
+                buffer.append(line)
 
     # Сохраняем последнюю секцию
-    if current_section and buffer:
-        sections[current_section] = "\n".join(buffer).strip()
+    if current_key is not None and buffer:
+        sections[current_key] = "\n".join(buffer).strip()
 
-    # Если не удалось распарсить — кладём весь текст в raw
-    if not any([sections["title"], sections["description"], sections["keywords"]]):
+    # Если не удалось распарсить ни одну секцию — кладём сырой текст
+    if not any(sections[k] for k in ("title", "description", "keywords")):
         sections["raw"] = raw_text
 
     return sections
