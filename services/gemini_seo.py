@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 # Инициализация клиента Gemini
 genai.configure(api_key=settings.GEMINI_API_KEY)
-_model = genai.GenerativeModel("gemini-2.5-flash")
+
 
 
 SEO_SYSTEM_PROMPT = """Ты — эксперт по SEO-оптимизации карточек товаров на маркетплейсе Wildberries.
@@ -97,20 +97,35 @@ async def generate_seo_card(
 [3-5 коротких инсайта о стратегии SEO конкурентов, что использовать и что избежать]
 """
 
-    try:
-        response = await _model.generate_content_async(
-            prompt,
-            generation_config=genai.GenerationConfig(
-                temperature=0.7,
-                max_output_tokens=2048,
-            ),
-        )
-        raw_text = response.text
-        return _parse_seo_response(raw_text)
+    models_to_try = [
+        settings.GEMINI_MODEL,
+        "gemini-2.5-flash",
+        "gemini-3.1-flash",
+        "gemini-3.5-flash-lite",
+    ]
+    # Удаляем дубликаты сохраняя порядок
+    seen = set()
+    models_to_try = [m for m in models_to_try if not (m in seen or seen.add(m))]
 
-    except Exception as e:
-        logger.error("Ошибка генерации SEO через Gemini: %s", e)
-        raise RuntimeError(f"Ошибка Gemini API: {e}") from e
+    last_error = None
+    for model_name in models_to_try:
+        try:
+            model = genai.GenerativeModel(model_name)
+            response = await model.generate_content_async(
+                prompt,
+                generation_config=genai.GenerationConfig(
+                    temperature=0.7,
+                    max_output_tokens=2048,
+                ),
+            )
+            raw_text = response.text
+            return _parse_seo_response(raw_text)
+        except Exception as e:
+            logger.warning("Не удалось использовать модель %s: %s", model_name, e)
+            last_error = e
+
+    logger.error("Все попытки генерации Gemini завершились ошибкой")
+    raise RuntimeError(f"Ошибка Gemini API: {last_error}") from last_error
 
 
 def _build_competitors_context(competitors: list[CompetitorProduct]) -> str:
