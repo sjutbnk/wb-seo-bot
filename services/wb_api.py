@@ -1,45 +1,68 @@
 """
-Сервис для работы с публичным API Wildberries (без авторизации).
+Сервис для работы с публичным API Wildberries.
 
-Используемые endpoints:
-- search.wb.ru  — поиск товаров (топ конкурентов) + автоподсказки (resultset=suggests)
-- card.wb.ru    — детальные данные карточки (название, бренд, категория)
-- basket-XX.wbbasket.ru — описание товара (card.json)
+Стратегия запросов (избегаем 429):
+1. Catalog-поиск идёт ПЕРВЫМ — пока IP «свежий»
+2. Suggests идёт ВТОРЫМ с паузой
+3. Ключи дополняются из имён/категорий конкурентов
+4. Retry с экспоненциальным backoff при 429
+5. Semaphore на параллельные запросы к деталям карточек
 """
 
 import asyncio
 import logging
+import random
 from dataclasses import dataclass, field
 
 import httpx
 
 logger = logging.getLogger(__name__)
 
-_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "ru-RU,ru;q=0.9",
-    "Referer": "https://www.wildberries.ru/",
-    "Origin": "https://www.wildberries.ru",
-}
+# ─────────────────────────────────────────────────────────────────────────────
+# Константы
+# ─────────────────────────────────────────────────────────────────────────────
 
 _TIMEOUT = httpx.Timeout(20.0)
-
-# Задержка между запросами к WB (секунды) — защита от 429
-_REQUEST_DELAY = 0.5
-# Сколько раз повторять запрос при 429
 _RETRY_COUNT = 3
-_RETRY_BACKOFF = 2.0  # множитель задержки
+_RETRY_BASE_DELAY = 2.0  # секунды
 
+# Ротация User-Agent для снижения вероятности блока
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+]
+
+_WB_DEST = -1257786  # Москва
+
+
+def _make_headers() -> dict[str, str]:
+    """Случайный User-Agent при каждом запросе."""
+    return {
+        "User-Agent": random.choice(_USER_AGENTS),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Referer": "https://www.wildberries.ru/",
+        "Origin": "https://www.wildberries.ru",
+        "Connection": "keep-alive",
+        "sec-ch-ua": '"Not/A)Brand";v="8", "Chromium";v="126"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-site",
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Модели данных
+# ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class CompetitorProduct:
-    """Данные одного товара-конкурента с WB."""
-
+    """Данные товара-конкурента из WB."""
     nm_id: int
     name: str
     brand: str
@@ -49,34 +72,29 @@ class CompetitorProduct:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Запрос с retry при 429
+# HTTP с retry
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def _get_with_retry(
+async def _get(
     client: httpx.AsyncClient,
     url: str,
     params: dict | None = None,
 ) -> httpx.Response | None:
     """
-    GET-запрос с автоматическим retry при HTTP 429.
-    Возвращает None если все попытки исчерпаны.
+    GET с retry при 429. Экспоненциальный backoff + jitter.
     """
-    delay = _REQUEST_DELAY
     for attempt in range(1, _RETRY_COUNT + 1):
         try:
-            resp = await client.get(url, params=params)
+            resp = await client.get(url, params=params, headers=_make_headers())
             if resp.status_code == 429:
-                wait = delay * (attempt ** _RETRY_BACKOFF)
-                logger.warning(
-                    "429 от %s, ожидание %.1fs (попытка %d/%d)",
-                    url, wait, attempt, _RETRY_COUNT,
-                )
-                await asyncio.sleep(wait)
+                delay = _RETRY_BASE_DELAY ** attempt + random.uniform(0.5, 1.5)
+                logger.warning("429 от WB [%s], ожидание %.1fs (попытка %d/%d)", url, delay, attempt, _RETRY_COUNT)
+                await asyncio.sleep(delay)
                 continue
             return resp
         except httpx.TimeoutException:
             logger.warning("Таймаут %s (попытка %d/%d)", url, attempt, _RETRY_COUNT)
-            await asyncio.sleep(delay)
+            await asyncio.sleep(_RETRY_BASE_DELAY * attempt)
         except Exception as e:
             logger.warning("Ошибка запроса %s: %s", url, e)
             return None
@@ -84,93 +102,23 @@ async def _get_with_retry(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Автоподсказки
-# ─────────────────────────────────────────────────────────────────────────────
-
-async def get_suggestions(query: str, count: int = 20) -> list[str]:
-    """
-    Возвращает список ключевых слов/фраз из автоподсказок поиска WB.
-    Использует resultset=suggests (актуальный рабочий endpoint).
-    """
-    suggestions: list[str] = [query]  # сам запрос всегда первый
-
-    async with httpx.AsyncClient(headers=_HEADERS, timeout=_TIMEOUT) as client:
-        resp = await _get_with_retry(
-            client,
-            "https://search.wb.ru/exactmatch/ru/common/v9/search",
-            params={
-                "appType": 1,
-                "curr": "rub",
-                "dest": -1257786,
-                "lang": "ru",
-                "query": query,
-                "resultset": "suggests",
-                "suppressSpellcheck": "false",
-            },
-        )
-
-        if resp is None or resp.status_code != 200:
-            logger.warning(
-                "Не удалось получить подсказки WB (status=%s)",
-                resp.status_code if resp else "no_response",
-            )
-            return suggestions
-
-        try:
-            data = resp.json()
-        except Exception:
-            logger.warning("Невалидный JSON от WB suggests")
-            return suggestions
-
-        # Парсим подсказки — WB возвращает их в разных форматах
-        for item in data.get("hints", []):
-            text = _extract_hint_text(item)
-            if text and text not in suggestions:
-                suggestions.append(text)
-
-        # Дополнительно — ключи из metadata
-        for item in data.get("shardList", []):
-            text = _extract_hint_text(item)
-            if text and text not in suggestions:
-                suggestions.append(text)
-
-    logger.info("Получено %d подсказок для '%s'", len(suggestions), query)
-    return suggestions[:count]
-
-
-def _extract_hint_text(item: dict | str) -> str:
-    """Извлекает текст подсказки из разных форматов ответа WB."""
-    if isinstance(item, str):
-        return item.strip()
-    if isinstance(item, dict):
-        return (
-            item.get("hint")
-            or item.get("name")
-            or item.get("text")
-            or item.get("query")
-            or ""
-        ).strip()
-    return ""
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Поиск конкурентов
+# Поиск конкурентов (ПРИОРИТЕТ — запускается первым)
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def search_competitors(query: str, limit: int = 10) -> list[int]:
     """
-    Возвращает список nm_id (артикулов) топ-товаров WB по поисковому запросу.
+    Топ nm_id из поиска WB по запросу.
+    Запускается ПЕРВЫМ, пока IP ещё не заблокирован.
     """
     nm_ids: list[int] = []
-
-    async with httpx.AsyncClient(headers=_HEADERS, timeout=_TIMEOUT) as client:
-        resp = await _get_with_retry(
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await _get(
             client,
             "https://search.wb.ru/exactmatch/ru/common/v9/search",
             params={
                 "appType": 1,
                 "curr": "rub",
-                "dest": -1257786,
+                "dest": _WB_DEST,
                 "lang": "ru",
                 "query": query,
                 "resultset": "catalog",
@@ -180,58 +128,102 @@ async def search_competitors(query: str, limit: int = 10) -> list[int]:
                 "page": 1,
             },
         )
-
         if resp is None or resp.status_code != 200:
-            logger.error(
-                "Не удалось получить конкурентов WB (status=%s)",
-                resp.status_code if resp else "no_response",
-            )
+            logger.error("Поиск конкурентов: status=%s", resp.status_code if resp else "none")
             return nm_ids
 
         try:
             data = resp.json()
-        except Exception:
-            logger.error("Невалидный JSON от WB search")
-            return nm_ids
+            for p in data.get("data", {}).get("products", [])[:limit]:
+                if nm_id := p.get("id"):
+                    nm_ids.append(int(nm_id))
+        except Exception as e:
+            logger.error("Ошибка парсинга поиска WB: %s", e)
 
-        products = data.get("data", {}).get("products", [])
-        for product in products[:limit]:
-            nm_id = product.get("id")
-            if nm_id:
-                nm_ids.append(int(nm_id))
-
-    logger.info("Найдено %d конкурентов для '%s'", len(nm_ids), query)
+    logger.info("Найдено конкурентов: %d", len(nm_ids))
     return nm_ids
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Детальные данные товара
+# Автоподсказки (запускается ПОСЛЕ поиска конкурентов)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def get_suggestions(query: str, count: int = 20) -> list[str]:
+    """
+    Ключевые слова из WB suggests.
+    resultset=suggests возвращает нормализованный запрос + metaданные.
+    Дополнительно генерируем варианты запроса вручную.
+    """
+    suggestions: list[str] = [query]
+
+    await asyncio.sleep(random.uniform(1.5, 3.0))  # пауза после catalog-запроса
+
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await _get(
+            client,
+            "https://search.wb.ru/exactmatch/ru/common/v9/search",
+            params={
+                "appType": 1,
+                "curr": "rub",
+                "dest": _WB_DEST,
+                "lang": "ru",
+                "query": query,
+                "resultset": "suggests",
+                "suppressSpellcheck": "false",
+            },
+        )
+
+        if resp and resp.status_code == 200:
+            try:
+                data = resp.json()
+                # normQuery — нормализованный вариант запроса от WB
+                norm = data.get("normQuery", "")
+                if norm and norm != query and norm not in suggestions:
+                    suggestions.append(norm)
+                # name — оригинальный запрос (обычно совпадает)
+                name = data.get("name", "")
+                if name and name not in suggestions:
+                    suggestions.append(name)
+            except Exception as e:
+                logger.warning("Ошибка парсинга suggests: %s", e)
+
+    # Дополняем вариациями запроса (частые паттерны WB)
+    words = query.lower().split()
+    if len(words) >= 2:
+        # Перестановка слов
+        for i in range(len(words)):
+            variant = " ".join(words[i:] + words[:i])
+            if variant != query and variant not in suggestions:
+                suggestions.append(variant)
+        # Добавляем категорийные уточнения
+        for suffix in ["купить", "цена", "недорого", "отзывы", "характеристики"]:
+            var = f"{query} {suffix}"
+            if var not in suggestions:
+                suggestions.append(var)
+
+    return suggestions[:count]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Детали товара
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def get_product_details(nm_id: int) -> CompetitorProduct | None:
-    """
-    Получает детальную информацию о товаре по nm_id:
-    - Название, бренд, категория — из card.wb.ru
-    - Описание — из basket-XX.wbbasket.ru/vol.../card.json
-    """
-    async with httpx.AsyncClient(headers=_HEADERS, timeout=_TIMEOUT) as client:
-        # ── 1. Основные данные: название, бренд, категория ────────────────
-        resp_detail = await _get_with_retry(
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        # Основные данные
+        resp = await _get(
             client,
             "https://card.wb.ru/cards/v2/detail",
-            params={"appType": 1, "curr": "rub", "nm": nm_id, "dest": -1257786},
+            params={"appType": 1, "curr": "rub", "nm": nm_id, "dest": _WB_DEST},
         )
-
-        if resp_detail is None or resp_detail.status_code != 200:
-            logger.warning("Нет данных карточки для nm_id=%d", nm_id)
+        if resp is None or resp.status_code != 200:
             return None
 
         try:
-            catalog_data = resp_detail.json()
+            products = resp.json().get("data", {}).get("products", [])
         except Exception:
             return None
 
-        products = catalog_data.get("data", {}).get("products", [])
         if not products:
             return None
 
@@ -240,10 +232,9 @@ async def get_product_details(nm_id: int) -> CompetitorProduct | None:
         brand: str = p.get("brand", "")
         subject_name: str = p.get("subjectName", "")
 
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(random.uniform(0.2, 0.5))
 
-        # ── 2. Описание из basket ─────────────────────────────────────────
-        description = await _fetch_card_description(client, nm_id)
+        description = await _fetch_description(client, nm_id)
 
         return CompetitorProduct(
             nm_id=nm_id,
@@ -255,75 +246,79 @@ async def get_product_details(nm_id: int) -> CompetitorProduct | None:
         )
 
 
-async def _fetch_card_description(client: httpx.AsyncClient, nm_id: int) -> str:
-    """
-    Получает описание товара из basket-хоста WB.
-    Правильный URL: basket-XX.wbbasket.ru/vol{vol}/part{part}/{nm_id}/info/ru/card.json
-    """
+async def _fetch_description(client: httpx.AsyncClient, nm_id: int) -> str:
     vol = nm_id // 100000
     part = nm_id // 1000
-    basket = _resolve_basket_num(vol)
-    url = (
-        f"https://basket-{basket}.wbbasket.ru"
-        f"/vol{vol}/part{part}/{nm_id}/info/ru/card.json"
-    )
-
+    basket = _resolve_basket(vol)
+    url = f"https://basket-{basket}.wbbasket.ru/vol{vol}/part{part}/{nm_id}/info/ru/card.json"
     try:
-        resp = await _get_with_retry(client, url)
-        if resp is None or resp.status_code != 200:
-            return ""
-        data = resp.json()
-        return data.get("description", "")
+        resp = await _get(client, url)
+        if resp and resp.status_code == 200:
+            return resp.json().get("description", "")
     except Exception as e:
-        logger.debug("Нет описания для nm_id=%d: %s", nm_id, e)
-        return ""
+        logger.debug("Нет описания nm=%d: %s", nm_id, e)
+    return ""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Сбор данных конкурентов (оркестратор)
+# Оркестратор: порядок важен
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def collect_competitors_data(
-    query: str, count: int = 10
-) -> list[CompetitorProduct]:
+async def collect_competitors_data(query: str, count: int = 10) -> list[CompetitorProduct]:
     """
-    Собирает данные конкурентов: поиск → детали каждого товара параллельно.
-    Параллельные запросы ограничены семафором чтобы не получать 429.
+    Параллельный сбор данных конкурентов.
+    Semaphore ограничивает нагрузку на WB.
     """
     nm_ids = await search_competitors(query, limit=count)
     if not nm_ids:
-        logger.warning("Конкуренты не найдены для запроса: %s", query)
         return []
 
-    # Семафор: не более 3 одновременных запросов к WB
-    semaphore = asyncio.Semaphore(3)
+    semaphore = asyncio.Semaphore(2)  # не более 2 одновременных запросов
 
-    async def fetch_with_limit(nm_id: int) -> CompetitorProduct | None:
+    async def fetch(nm_id: int) -> CompetitorProduct | None:
         async with semaphore:
             result = await get_product_details(nm_id)
-            await asyncio.sleep(0.3)  # вежливая задержка
+            await asyncio.sleep(random.uniform(0.3, 0.8))
             return result
 
-    tasks = [fetch_with_limit(nm_id) for nm_id in nm_ids]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    results = await asyncio.gather(*[fetch(nm) for nm in nm_ids], return_exceptions=True)
 
-    competitors: list[CompetitorProduct] = []
-    for result in results:
-        if isinstance(result, CompetitorProduct):
-            competitors.append(result)
-        elif isinstance(result, Exception):
-            logger.warning("Ошибка при сборе данных конкурента: %s", result)
-
-    logger.info("Собрано %d конкурентов", len(competitors))
+    competitors = [r for r in results if isinstance(r, CompetitorProduct)]
+    logger.info("Собрано данных конкурентов: %d/%d", len(competitors), len(nm_ids))
     return competitors
 
 
+def enrich_suggestions_from_competitors(
+    suggestions: list[str],
+    competitors: list[CompetitorProduct],
+    count: int = 20,
+) -> list[str]:
+    """
+    Дополняет список ключевых слов словами из имён конкурентов.
+    Вызывается в handler ПОСЛЕ получения конкурентов.
+    """
+    enriched = list(suggestions)
+    seen = {s.lower() for s in enriched}
+
+    for c in competitors[:8]:
+        for kw in c.keywords_from_name:
+            if kw.lower() not in seen and len(kw) > 3:
+                enriched.append(kw)
+                seen.add(kw.lower())
+        # Добавляем subject как ключ (категория товара)
+        subj = c.subject_name.strip().lower()
+        if subj and subj not in seen:
+            enriched.append(c.subject_name)
+            seen.add(subj)
+
+    return enriched[:count]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Вспомогательные функции
+# Вспомогательные
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _resolve_basket_num(vol: int) -> str:
-    """Определяет номер basket-хоста по vol (nm_id // 100000)."""
+def _resolve_basket(vol: int) -> str:
     thresholds = [
         (143, "01"), (287, "02"), (431, "03"), (719, "04"),
         (1007, "05"), (1061, "06"), (1115, "07"), (1169, "08"),
@@ -338,15 +333,12 @@ def _resolve_basket_num(vol: int) -> str:
 
 
 def _extract_keywords(text: str) -> list[str]:
-    """Извлекает значимые слова из названия товара."""
-    stop_words = {
-        "и", "в", "на", "для", "с", "по", "из", "от", "к", "у", "о",
-        "не", "это", "как", "но", "а", "же", "так", "то", "что", "если",
-        "все", "при", "за", "об", "или", "до", "без", "уже", "мм", "см",
-        "кг", "шт", "г", "л", "мл", "пк", "цвет", "размер",
+    stop = {
+        "и","в","на","для","с","по","из","от","к","у","о","не","это","как",
+        "но","а","же","так","то","что","если","все","при","за","об","или",
+        "до","без","уже","мм","см","кг","шт","г","л","мл","пк","цвет","размер",
     }
-    words = text.lower().split()
     return [
-        w.strip(".,;:!?\"'()[]") for w in words
-        if len(w) > 3 and w.strip(".,;:!?\"'()[]") not in stop_words
+        w.strip(".,;:!?\"'()[]") for w in text.lower().split()
+        if len(w) > 3 and w.strip(".,;:!?\"'()[]") not in stop
     ]
