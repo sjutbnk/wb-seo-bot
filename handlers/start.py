@@ -1,31 +1,34 @@
 """
-Хэндлер команды /start — приветственное сообщение.
+Хэндлер /start — приветственное сообщение.
 """
 
 from aiogram import Router
 from aiogram.filters import CommandStart
-from aiogram.types import Message
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 router = Router()
+
+_EXAMPLE_KB = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="▶ Попробовать: робот мойщик окон", callback_data="example:робот мойщик окон")],
+])
 
 
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     await message.answer(
-        "👋 <b>Привет! Я SEO-бот для Wildberries</b>\n\n"
-        "Создаю SEO-оптимизированные карточки товаров:\n"
-        "• Ключевые слова из реального поиска WB\n"
-        "• Анализ топ конкурентов в выдаче\n"
-        "• Продающее описание + список ключей через Gemini AI\n"
-        "• Прямая загрузка карточки на WB (нужен токен продавца)\n\n"
-        "📝 <b>Как использовать:</b>\n"
-        "Просто напиши название или тип товара:\n"
+        "<b>WB SEO Bot</b>\n\n"
+        "Создаю SEO-карточки для Wildberries:\n"
+        "— Реальные ключи из поиска WB\n"
+        "— Анализ топ-10 конкурентов\n"
+        "— Продающее описание через Gemini AI\n"
+        "— Загрузка карточки напрямую на WB\n\n"
+        "<b>Как использовать</b>\n"
+        "Напишите название или тип товара:\n"
         "<i>кроссовки мужские летние</i>\n"
-        "<i>платье вечернее с открытой спиной</i>\n\n"
-        "⚙️ <b>Команды:</b>\n"
+        "<i>робот мойщик окон с распылителем</i>\n\n"
+        "После сбора данных выберите что сгенерировать:\n"
+        "📝 Описание · 🔑 Ключи · 📊 Анализ · ✅ Всё\n\n"
         "/upload — загрузить карточку на WB\n"
-        "/help — справка и статус WB API\n\n"
-        "⏱ Анализ занимает ~30-60 секунд.",
+        "/help — справка",
         parse_mode="HTML",
     )
-
