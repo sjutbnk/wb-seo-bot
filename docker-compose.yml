@@ -1,0 +1,29 @@
+services:
+  wb-seo-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: wb-seo-bot
+
+    # Переменные окружения берём из .env файла на хосте
+    env_file:
+      - .env
+
+    # Автоперезапуск при падении или перезагрузке VPS
+    restart: unless-stopped
+
+    # Логи: последние 10 МБ, не более 3 файлов ротации
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # Ограничения ресурсов (подбери под свой VPS)
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          memory: 64M
